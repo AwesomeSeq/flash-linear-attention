@@ -28,7 +28,7 @@ This repo aims at providing a collection of efficient Triton-based implementatio
 * [Acknowledgements](#acknowledgements)
 
 ## News
-
+- **$\texttt{[2025-11]}$:** 🎉 Add GSA2 implementation to `fla`.
 - **$\texttt{[2025-10]}$:** 🌑 Add Kimi Delta Attention implementation to `fla` ([paper](https://arxiv.org/abs/2510.26692)).
 - **$\texttt{[2025-09]}$:** 🌲 Add DeltaFormer implementation to `fla` ([paper](https://arxiv.org/abs/2505.19488v1)).
 - **$\texttt{[2025-09]}$:** 🐻 Thrilled to announce that [GDN](fla/ops/gated_delta_rule) has been integrated into Qwen3-Next. Check out their [blog post](https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd&from=research.latest-advancements-list) for more infos!
