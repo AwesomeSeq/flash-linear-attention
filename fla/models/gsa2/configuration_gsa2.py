@@ -47,6 +47,9 @@ class GSA2Config(PretrainedConfig):
         use_w_lora: bool = False,
         use_kda_gate: bool = False,
         use_qk_norm: bool = False,
+        use_v_norm: bool = False,
+        use_w_norm: bool = True,
+        learning_rule: str = "oja-delta",
         scale_k: int = None,
         scale_v: int = None,
         vocab_size: int = 32000,
@@ -78,6 +81,9 @@ class GSA2Config(PretrainedConfig):
         self.use_w_lora = use_w_lora
         self.use_kda_gate = use_kda_gate
         self.use_qk_norm = use_qk_norm
+        self.use_v_norm = use_v_norm
+        self.use_w_norm = use_w_norm
+        self.learning_rule = learning_rule
         self.scale_k = scale_k
         self.scale_v = scale_v
         self.initializer_range = initializer_range

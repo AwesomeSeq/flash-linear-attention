@@ -776,7 +776,7 @@ def chunk_oja2_bwd_kernel_dvwg_h(
     dk += (bos * H + i_h) * K
     dw += (bos * H + i_h) * V
     dv += (bos * H + i_h) * V
-    dgv_last += (bos * H + i_h) * V       
+    dgv_last += (bos * H + i_h) * V
 
     b_dvg = tl.zeros([BT, BV], dtype=tl.float32)
     b_dw = tl.zeros([BT, BV], dtype=tl.float32)

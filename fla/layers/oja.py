@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -12,10 +12,8 @@ from torch.nn import functional as F
 
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, ShortConvolution
-from fla.ops.gsa2 import chunk_gsa2
-from fla.ops.gsa3 import chunk_gsa3
+from fla.ops.kda import chunk_kda, fused_recurrent_kda
 from fla.ops.kda.gate import fused_kda_gate
-from fla.modules.l2norm import l2_norm
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -23,15 +21,49 @@ if TYPE_CHECKING:
     from fla.models.utils import Cache
 
 
-class GatedSlotAttention2(nn.Module):
+class GatedOJANet(nn.Module):
+    """
+    Kimi Delta Attention (KDA) layer implementation.
+
+    Args:
+        hidden_size (int, Optional):
+            The hidden size of the input. Default: 2048.
+        expand_v (float, Optional):
+            The expansion ratio for the value dimension. Default: 1.0.
+        head_dim (int, Optional):
+            The dimension of each head. Default: 128.
+        num_heads (int, Optional):
+            The number of heads. Default: 16.
+        num_v_heads (int, Optional):
+            The number of heads for the value projection, equal to `num_heads` if `None`.
+            GVA (Grouped Value Attention) is applied if `num_v_heads` > `num_heads`. Default: `None`.
+        mode (str, Optional):
+            Which Kimi Delta Attention kernel to use.
+            Currently available: `chunk` and `fused_recurrent`.
+            Default: `chunk`.
+        use_short_conv (bool, Optional):
+            Whether to use short convolutions. Default: `True`.
+        allow_neg_eigval (bool, Optional):
+            Allow negative eigenvalues. Default: `False`. If set to `True`, the beta will be multiplied by 2.
+            See reference:
+            [Unlocking State-Tracking in Linear RNNs Through Negative Eigenvalues](https://arxiv.org/abs/2411.12537)
+        conv_size (int, Optional):
+            The kernel size of the short convolution, only used when `use_short_conv` is `True`. Default: 4.
+        conv_bias (bool, Optional):
+            Whether to use bias in the short convolution, only used when `use_short_conv` is `True`. Default: `False`.
+        layer_idx (int, Optional):
+            The index of the layer. Default: None.
+        norm_eps (float, Optional):
+            The epsilon value for the normalization layer. Default: 1e-5.
+    """
 
     def __init__(
         self,
         hidden_size: int = 2048,
+        expand_v: float = 1,
         head_dim: int = 128,
         num_heads: int = 16,
         num_v_heads: int = None,
-        expand_v: int = 1, 
         mode: str = 'chunk',
         use_short_conv: bool = True,
         allow_neg_eigval: bool = False,
@@ -39,22 +71,14 @@ class GatedSlotAttention2(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
-        num_slots: Optional[int] = None,
-        scale_k: Optional[int] = None,
-        scale_v: Optional[int] = None,
-        use_w_lora: bool = False,
-        use_kda_gate: bool = False,
-        use_qk_norm: bool = False,
-        use_v_norm: bool = False,
-        use_w_norm: bool = True,
-        learning_rule: str = 'oja-delta',
         **kwargs,
-    ) -> GatedSlotAttention2:
+    ) -> KimiDeltaAttention:
         super().__init__()
 
         self.mode = mode
         self.allow_neg_eigval = allow_neg_eigval
         self.hidden_size = hidden_size
+        self.expand_v = expand_v
 
         self.use_short_conv = use_short_conv
         self.conv_size = conv_size
@@ -65,28 +89,32 @@ class GatedSlotAttention2(nn.Module):
         self.num_v_heads = num_v_heads if num_v_heads is not None else num_heads
 
         self.head_k_dim = head_dim
-        self.head_v_dim = int(self.head_dim * expand_v)
-        if num_slots is None:
-            num_slots = self.head_k_dim
-        self.num_slots = num_slots
-        
+        self.head_v_dim = int(self.head_dim * self.expand_v)
         self.key_dim = int(self.num_heads * self.head_k_dim)
         self.value_dim = int(self.num_v_heads * self.head_v_dim)
-        self.w_dim = int(self.num_heads * num_slots)
         self.layer_idx = layer_idx
-        self.use_kda_gate = use_kda_gate
-        self.scale_k = scale_k
-        self.scale_v = scale_v
-        self.use_qk_norm = use_qk_norm
-        self.use_v_norm = use_v_norm
-        self.use_w_norm = use_w_norm
-        self.learning_rule = learning_rule
 
+        # Consistency check: Ensure expand_v produces integer values
+        if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
+            raise ValueError(
+                f"expand_v={expand_v} does not produce an integer value when multiplied by key_dim={self.key_dim}. "
+                f"Resulting value_dim would be {self.num_v_heads * self.head_dim * expand_v}, which is invalid for nn.Linear.",
+            )
         if self.num_v_heads > self.num_heads and self.num_v_heads % self.num_heads != 0:
             raise ValueError(
                 f"num_v_heads={self.num_v_heads} must be divisible by num_heads={self.num_heads}.",
             )
+
+        if not math.isclose(head_dim * expand_v, self.head_v_dim, rel_tol=1e-5):
+            raise ValueError(
+                f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
+                f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated.",
+            )
         assert mode in ['chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
+
+        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
 
         if use_short_conv:
             self.q_conv1d = ShortConvolution(
@@ -107,31 +135,18 @@ class GatedSlotAttention2(nn.Module):
                 bias=conv_bias,
                 activation='silu',
             )
-            self.w_conv1d = ShortConvolution(
-                hidden_size=self.w_dim,
-                kernel_size=conv_size,
-                bias=conv_bias,
-                activation='silu',
-            )
 
-        self.q_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_size, self.key_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
-        if use_w_lora:
-            self.w_proj = nn.Sequential(
-                nn.Linear(hidden_size, self.head_v_dim, bias=False),
-                nn.Linear(self.head_v_dim, self.w_dim, bias=False),
-            )
-        else:
-            self.w_proj = nn.Linear(hidden_size, self.w_dim, bias=False)
         self.f_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
-            nn.Linear(self.head_v_dim, self.w_dim, bias=False),
+            nn.Linear(self.head_v_dim, self.key_dim, bias=False),
         )
-        if use_kda_gate:
-            self.A_log = nn.Parameter(torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)))
-            self.dt_bias = nn.Parameter(torch.zeros(self.key_dim, dtype=torch.float32))
         self.b_proj = nn.Linear(hidden_size, self.num_heads, bias=False)
+
+        self.A_log = nn.Parameter(torch.log(torch.empty(self.num_heads, dtype=torch.float32).uniform_(1, 16)))
+        self.A_log._no_weight_decay = True
+        self.dt_bias = nn.Parameter(torch.zeros(self.key_dim, dtype=torch.float32))
+        self.dt_bias._no_weight_decay = True
+
         self.g_proj = nn.Sequential(
             nn.Linear(hidden_size, self.head_v_dim, bias=False),
             nn.Linear(self.head_v_dim, self.value_dim, bias=True),
@@ -171,9 +186,9 @@ class GatedSlotAttention2(nn.Module):
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
         if self.use_short_conv:
-            conv_state_q, conv_state_k, conv_state_v, conv_state_w = None, None, None, None
+            conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
-                conv_state_q, conv_state_k, conv_state_v, conv_state_w = last_state['conv_state']
+                conv_state_q, conv_state_k, conv_state_v = last_state['conv_state']
             q, conv_state_q = self.q_conv1d(
                 x=self.q_proj(hidden_states),
                 cache=conv_state_q,
@@ -192,81 +207,58 @@ class GatedSlotAttention2(nn.Module):
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
             )
-            w, conv_state_w = self.v_conv1d(
-                x=self.w_proj(hidden_states),
-                cache=conv_state_w,
-                output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-            )
         else:
             q = F.silu(self.q_proj(hidden_states))
             k = F.silu(self.k_proj(hidden_states))
             v = F.silu(self.v_proj(hidden_states))
 
         g = self.f_proj(hidden_states)
-        if self.use_kda_gate:
-            g = fused_kda_gate(g, self.A_log, self.head_k_dim, g_bias=self.dt_bias)
-        else:
-            g = F.logsigmoid(g)
-            g = rearrange(g, '... (h d) -> ... h d', d=self.num_slots)
+        g = fused_kda_gate(g, self.A_log, self.head_k_dim, g_bias=self.dt_bias)
         beta = self.b_proj(hidden_states).sigmoid()
 
         q, k = (rearrange(x, '... (h d) -> ... h d', d=self.head_k_dim) for x in (q, k))
         v = rearrange(v, '... (h d) -> ... h d', d=self.head_v_dim)
-        w = rearrange(w, '... (h d) -> ... h d', d=self.num_slots)
-        if self.use_w_norm:
-            w = l2_norm(w)
-        if self.use_qk_norm:
-            q = l2_norm(q)
-            k = l2_norm(k)
-        if self.use_v_norm:
-            v = l2_norm(v)
 
+        # for multi-value attention, we repeat the inputs for simplicity.
         if self.num_v_heads > self.num_heads:
-            q, k = (repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads) for x in (q, k))
+            q, k, g = (repeat(x, '... h d -> ... (h g) d', g=self.num_v_heads // self.num_heads) for x in (q, k, g))
+            beta = repeat(beta, '... h -> ... (h g)', g=self.num_v_heads // self.num_heads)
 
         if self.allow_neg_eigval:
             beta = beta * 2.
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
-            if self.learning_rule == 'oja-delta':
-                o, recurrent_state = chunk_gsa2(
-                    q=q,
-                    k=k,
-                    v=v,
-                    w=w,
-                    g=g,
-                    beta=beta,
-                    scale_k=self.scale_k,
-                    scale_v=self.scale_v,
-                    initial_state=recurrent_state,
-                    output_final_state=use_cache,
-                    cu_seqlens=cu_seqlens,
-                )
-            elif self.learning_rule == 'delta-oja':
-                o, recurrent_state = chunk_gsa3(
-                    q=q,
-                    k=k,
-                    v=v,
-                    w=w,
-                    g=g,
-                    beta=beta,
-                    scale_k=self.scale_k,
-                    scale_v=self.scale_v,
-                    initial_state=recurrent_state,
-                    output_final_state=use_cache,
-                    cu_seqlens=cu_seqlens,
-                )
+            o, recurrent_state = chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
         elif mode == 'fused_recurrent':
-            assert NotImplementedError(f"ohhh, gsa2 only support training mode for now.")
+            o, recurrent_state = fused_recurrent_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=use_cache,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 
         if past_key_values is not None:
             past_key_values.update(
                 recurrent_state=recurrent_state,
-                conv_state=(conv_state_q, conv_state_k, conv_state_v, conv_state_w) if self.use_short_conv else None,
+                conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
                 layer_idx=self.layer_idx,
                 offset=q_len,
             )

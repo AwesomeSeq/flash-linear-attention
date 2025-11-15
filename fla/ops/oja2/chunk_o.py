@@ -471,7 +471,7 @@ def chunk_oja2_bwd_kernel_dqk(
         b_do = tl.load(p_do, boundary_check=(0, 1))
         b_gv = tl.load(p_gv, boundary_check=(0, 1))
         b_do = (b_do * exp(b_gv) * scale).to(b_do.dtype)
-        b_dq += tl.dot(b_do, b_h.to(b_k.dtype))
+        b_dq += tl.dot(b_do, b_h.to(b_do.dtype))
         
     # 接着计算dA对应的dq, dk
     p_dA = tl.make_block_ptr(dA + (bos*H + i_h) * BT, (T, BT), (H*BT, 1), (i_t * BT, 0), (BT, BT), (1, 0))
