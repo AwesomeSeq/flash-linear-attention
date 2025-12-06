@@ -13,7 +13,9 @@ from torch.nn import functional as F
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
 from fla.modules import FusedRMSNormGated, ShortConvolution
 from fla.ops.kda import chunk_kda, fused_recurrent_kda
+from fla.ops.oja2 import chunk_oja2, fused_recurrent_oja2
 from fla.ops.kda.gate import fused_kda_gate
+from fla.modules.l2norm import l2_norm
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -71,6 +73,7 @@ class KimiDeltaAttention(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
+        use_oja: bool = False,
         **kwargs,
     ) -> KimiDeltaAttention:
         super().__init__()
@@ -93,6 +96,7 @@ class KimiDeltaAttention(nn.Module):
         self.key_dim = int(self.num_heads * self.head_k_dim)
         self.value_dim = int(self.num_v_heads * self.head_v_dim)
         self.layer_idx = layer_idx
+        self.use_oja = use_oja
 
         # Consistency check: Ensure expand_v produces integer values
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
@@ -229,29 +233,58 @@ class KimiDeltaAttention(nn.Module):
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
         if mode == 'chunk':
-            o, recurrent_state = chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-            )
+            if self.use_oja:
+                q = l2_norm(q)
+                k = l2_norm(k)
+                v = l2_norm(v)
+                o, recurrent_state = chunk_oja2(
+                    q=q,
+                    k=k,
+                    v=v,
+                    gv=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
+                )
+            else:
+                o, recurrent_state = chunk_kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu_seqlens,
+                )
         elif mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                initial_state=recurrent_state,
-                output_final_state=use_cache,
-                use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-            )
+            if self.use_oja:
+                v = l2_norm(v)
+                o, recurrent_state = fused_recurrent_oja2(
+                    q=q,
+                    k=k,
+                    v=v,
+                    gv=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu_seqlens,
+                )
+            else:
+                o, recurrent_state = fused_recurrent_kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    initial_state=recurrent_state,
+                    output_final_state=use_cache,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=cu_seqlens,
+                )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
 

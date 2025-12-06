@@ -323,7 +323,7 @@ class ChunkOJA2Function(torch.autograd.Function):
 
 
 @torch.compiler.disable
-def chunk_oja2(
+def chunk_nha(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,

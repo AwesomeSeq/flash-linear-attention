@@ -61,6 +61,7 @@ class KDABlock(nn.Module):
                 num_heads=config.num_heads,
                 num_v_heads=config.num_v_heads,
                 use_short_conv=config.use_short_conv,
+                use_oja=config.use_oja,
                 allow_neg_eigval=config.allow_neg_eigval,
                 conv_size=config.conv_size,
                 norm_eps=config.norm_eps,

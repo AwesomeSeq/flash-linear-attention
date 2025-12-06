@@ -38,6 +38,7 @@ def recurrent_oja2_ref(
         b_k = k[:, :, i]
         b_v = v[:, :, i] # B H D
         g_i = g[:, :, i]
+        # breakpoint()
         h = h * g_i.exp()[:, :, None, :]
         b_beta = beta[:, :, i]
         b_k = b_k - (h * b_v[:, :, None, :]).sum(-1)
@@ -414,8 +415,8 @@ def test_chunk(
     [
         pytest.param(*test, id="H{}-D{}-mask_p{}-cu_seqlens{}-{}".format(*test))
         for test in [
-            # (4, 60, 0, [0, 15], torch.float16),
-            (4, 64, 0, [0, 256, 500, 1000], torch.float16),
+            (4, 60, 0, [0, 96, 177], torch.float16),
+            (16, 128, 0, [0, 256, 500, 1000], torch.float16),
             (4, 64, 0.5, [0, 256, 500, 1000], torch.float16),
             (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.float16),
         ]
@@ -445,7 +446,7 @@ def test_chunk_varlen(
     q = torch.randn((1, T, H, D), dtype=dtype)
     k = torch.randn((1, T, H, D), dtype=dtype)
     v = F.normalize(torch.randn(1, T, H, D, dtype=torch.float32), p=2, dim=-1).to(dtype)
-    g = F.logsigmoid(torch.rand(1, T, H, dtype=dtype))
+    g = F.logsigmoid(torch.rand(1, T, H, D, dtype=torch.float))
     g = g * (torch.rand_like(g) > mask_p)
     beta = torch.rand(1, T, H, dtype=torch.float32).sigmoid()
     h0 = torch.randn((N, H, D, D), dtype=torch.float32)

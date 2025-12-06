@@ -13,6 +13,7 @@ class KDAConfig(PretrainedConfig):
         hidden_size: int = 2048,
         expand_v: float = 1.0,
         use_short_conv: bool = True,
+        use_oja: bool = False,
         allow_neg_eigval: bool = False,
         conv_size: int = 4,
         head_dim: int = 128,
@@ -55,6 +56,7 @@ class KDAConfig(PretrainedConfig):
         self.norm_eps = norm_eps
         self.attn = attn
         self.use_cache = use_cache
+        self.use_oja = use_oja
         self.initializer_range = initializer_range
 
         self.fuse_norm = fuse_norm
